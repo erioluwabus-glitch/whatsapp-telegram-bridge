@@ -1,63 +1,93 @@
 // src/whatsapp.js
-import makeWASocket, { DisconnectReason } from '@whiskeysockets/baileys'
+import fs from 'fs/promises'
+import path from 'path'
+import makeWASocket, { useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys'
 import logger from './logger.js'
 import Session from './models/Session.js'
 import Mapping from './models/Mapping.js'
 
-export async function startWhatsApp(tgBot, TELEGRAM_GROUP_ID) {
-  // Load saved session (if any)
-  let saved = null
+const AUTH_DIR = './baileys_auth' // folder Baileys will use; ephemeral on Render but we persist contents to Mongo
+
+async function ensureAuthDirFromMongo() {
   try {
-    saved = await Session.findOne({ id: 'whatsapp-session' })
-    if (saved) logger.info('Loaded saved WhatsApp session from Mongo')
-  } catch (e) {
-    logger.warn({ e }, 'Error reading Session from Mongo (continuing without saved creds)')
+    const doc = await Session.findOne({ id: 'whatsapp-session' })
+    if (!doc || !doc.files) return
+    // ensure directory exists
+    await fs.mkdir(AUTH_DIR, { recursive: true })
+    // write each file back to the auth dir
+    const entries = Object.entries(doc.files)
+    for (const [filename, content] of entries) {
+      const filePath = path.join(AUTH_DIR, filename)
+      await fs.writeFile(filePath, content, 'utf8')
+    }
+    logger.info('Restored Baileys auth files from Mongo to', AUTH_DIR)
+  } catch (err) {
+    logger.warn({ err }, 'Could not restore auth files from Mongo (starting fresh)')
   }
+}
 
-  const auth = saved?.data || undefined
+async function persistAuthDirToMongo() {
+  try {
+    // read all files in auth dir
+    const files = await fs.readdir(AUTH_DIR)
+    const data = {}
+    for (const file of files) {
+      const content = await fs.readFile(path.join(AUTH_DIR, file), 'utf8')
+      data[file] = content
+    }
+    await Session.findOneAndUpdate(
+      { id: 'whatsapp-session' },
+      { id: 'whatsapp-session', files: data, updatedAt: new Date() },
+      { upsert: true }
+    )
+    logger.info('Saved Baileys auth files to Mongo (session persisted)')
+  } catch (err) {
+    logger.error({ err }, 'Failed to persist auth files to Mongo')
+  }
+}
 
+export async function startWhatsApp(tgBot, TELEGRAM_GROUP_ID) {
+  // Attempt to restore auth files from Mongo into AUTH_DIR before initializing
+  await ensureAuthDirFromMongo()
+
+  // use Baileys multi-file auth state pointed at AUTH_DIR
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
+
+  // create socket with the loaded state (if any)
   const sock = makeWASocket({
-    auth,
+    auth: state,
     printQRInTerminal: true
   })
 
-  // Persist credentials when they update
+  // Whenever Baileys updates creds, save via saveCreds(), then persist folder to Mongo
   sock.ev.on('creds.update', async () => {
     try {
-      // Attempt to read credentials from known locations on the socket
-      const creds = (sock.authState && sock.authState.creds) || (sock.auth && sock.auth.creds) || {}
-      await Session.findOneAndUpdate(
-        { id: 'whatsapp-session' },
-        { data: creds, updatedAt: new Date() },
-        { upsert: true }
-      )
-      logger.info('Saved WhatsApp session to Mongo')
+      await saveCreds() // writes to AUTH_DIR
+      await persistAuthDirToMongo()
     } catch (err) {
-      logger.error({ err }, 'Failed to save WhatsApp session to Mongo')
+      logger.error({ err }, 'Error saving credentials')
     }
   })
 
-  // Connection/reconnect handling
+  // connection lifecycle
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect } = update
     logger.info({ update }, 'WA connection.update')
-
     if (connection === 'close') {
-      // Use plain JS optional chaining to get the status code
       const statusCode = lastDisconnect?.error?.output?.statusCode
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut
       logger.info({ statusCode, shouldReconnect }, 'WA connection closed')
       if (shouldReconnect) {
         setTimeout(() => startWhatsApp(tgBot, TELEGRAM_GROUP_ID), 5000)
       } else {
-        logger.warn('WA logged out — recreate session by scanning QR again')
+        logger.warn('WA logged out — need to rescan QR to re-authenticate')
       }
     } else if (connection === 'open') {
       logger.info('✅ WhatsApp connection opened')
     }
   })
 
-  // Incoming message handling
+  // messages.upsert handler: forward to Telegram group, store mapping, ack WA sender
   sock.ev.on('messages.upsert', async (m) => {
     try {
       const msg = m.messages?.[0]
@@ -69,10 +99,10 @@ export async function startWhatsApp(tgBot, TELEGRAM_GROUP_ID) {
       const senderJid = msg.key.remoteJid
       logger.info({ senderJid, text }, 'Incoming WA message')
 
-      // Forward to Telegram group
+      // forward to Telegram group
       try {
         const sent = await tgBot.sendMessage(TELEGRAM_GROUP_ID, `From WhatsApp (${senderJid}):\n${text}`)
-        // Save mapping: telegramMsgId -> waJid
+        // Save mapping: telegram message id -> waJid
         await Mapping.findOneAndUpdate(
           { telegramMsgId: sent.message_id },
           { waJid: senderJid },
@@ -86,6 +116,11 @@ export async function startWhatsApp(tgBot, TELEGRAM_GROUP_ID) {
     } catch (err) {
       logger.error({ err }, 'Error in messages.upsert')
     }
+  })
+
+  // also persist auth on process exit to minimize lost updates (best-effort)
+  process.on('beforeExit', async () => {
+    try { await persistAuthDirToMongo() } catch (e) { /* ignore */ }
   })
 
   return sock
