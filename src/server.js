@@ -1,10 +1,8 @@
-// src/server.js
-import express from 'express';
-import logger from './logger.js';
+import express from "express";
 
-export function startServer(port = process.env.PORT || 3000) {
+export function startServer() {
   const app = express();
-  app.get('/', (req, res) => res.send('✅ WhatsApp ↔ Telegram Bridge is running'));
-  app.get('/health', (req, res) => res.json({ ok: true }));
-  app.listen(port, () => logger.info(`HTTP server listening on ${port}`));
+  const PORT = process.env.PORT || 10000;
+  app.get("/", (req, res) => res.send("Bridge is running 🚀"));
+  app.listen(PORT, () => console.log(`🌐 Server listening on ${PORT}`));
 }
