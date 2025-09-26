@@ -1,17 +1,10 @@
-// src/server.js
-import express from 'express';
-import logger from './logger.js';
+// src/models/Session.js
+import mongoose from 'mongoose';
 
-export function startServer(port = process.env.PORT || 10000) {
-  const app = express();
+const sessionSchema = new mongoose.Schema({
+  id: { type: String, unique: true, required: true },
+  files: { type: Map, of: String }, // saved auth files (filename -> content)
+  updatedAt: { type: Date, default: Date.now }
+});
 
-  app.get('/', (req, res) => res.send('✅ WhatsApp ↔ Telegram Bridge is running'));
-  app.get('/health', (req, res) => res.json({ ok: true }));
-
-  const server = app.listen(port, () => {
-    logger.info(`🌐 Web server started on port ${port}`);
-  });
-
-  // return server instance in case caller wants to close it later
-  return server;
-}
+export default mongoose.models.Session || mongoose.model('Session', sessionSchema);
