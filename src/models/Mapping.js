@@ -1,10 +1,10 @@
-import mongoose from 'mongoose'
+// src/models/Mapping.js
+import mongoose from 'mongoose';
 
-const MappingSchema = new mongoose.Schema({
-  telegramMsgId: { type: Number, required: true, unique: true },
+const mappingSchema = new mongoose.Schema({
+  telegramMsgId: { type: Number, required: true, unique: true, index: true },
   waJid: { type: String, required: true },
-  createdAt: { type: Date, default: Date.now, expires: '14d' } 
-  // ⏳ auto-delete mappings after 7 days (adjust if needed)
-})
+  createdAt: { type: Date, default: Date.now }
+});
 
-export default mongoose.model('Mapping', MappingSchema)
+export default mongoose.models.Mapping || mongoose.model('Mapping', mappingSchema);
