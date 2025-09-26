@@ -1,3 +1,12 @@
+console.log("🔍 Starting bridge...");
+["MONGODB_URI", "TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "WHATSAPP_ID"].forEach(v => {
+  if (!process.env[v]) {
+    console.error(`❌ Missing env var: ${v}`);
+  } else {
+    console.log(`✅ ${v} is set`);
+  }
+});
+
 import mongoose from 'mongoose'
 import logger from './logger.js'
 import { startWhatsApp } from './whatsapp.js'
@@ -50,4 +59,5 @@ async function main() {
 }
 
 main()
+
 
