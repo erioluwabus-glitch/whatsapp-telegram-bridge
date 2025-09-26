@@ -1,8 +1,10 @@
-import mongoose from 'mongoose'
+// src/models/Session.js
+import mongoose from 'mongoose';
 
-const SessionSchema = new mongoose.Schema({
-  id: { type: String, required: true, unique: true },
-  data: { type: Object, required: true }
-})
+const sessionSchema = new mongoose.Schema({
+  id: { type: String, unique: true, required: true }, // e.g. 'baileys-auth-v1'
+  files: { type: Map, of: String }, // filename -> file content
+  updatedAt: { type: Date, default: Date.now }
+});
 
-export default mongoose.model('Session', SessionSchema)
+export default mongoose.models.Session || mongoose.model('Session', sessionSchema);
