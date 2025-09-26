@@ -1,11 +1,10 @@
-// Simple runtime mapping (will reset if app restarts)
-// Later we could persist in MongoDB if needed
-const messageMap = new Map()
+// src/models/Mapping.js
+import mongoose from 'mongoose';
 
-export function saveMapping(telegramMsgId, waJid) {
-  messageMap.set(telegramMsgId, waJid)
-}
+const mappingSchema = new mongoose.Schema({
+  telegramMsgId: { type: Number, required: true, unique: true, index: true },
+  waJid: { type: String, required: true },
+  createdAt: { type: Date, default: Date.now }
+});
 
-export function getMapping(telegramMsgId) {
-  return messageMap.get(telegramMsgId)
-}
+export default mongoose.models.Mapping || mongoose.model('Mapping', mappingSchema);
