@@ -1,44 +1,36 @@
-import TelegramBot from 'node-telegram-bot-api'
-import Mapping from './models/Mapping.js'
+// src/index.js
+import mongoose from "mongoose";
+import logger from "./logger.js";
+import { startWhatsApp } from "./whatsapp.js";
+import { setupTelegram } from "./telegram.js";
+import { startQueueWorker } from "./queue.js";
+import { startServer } from "./server.js";
+import { setupGracefulShutdown } from "./graceful.js";
 
-const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: true })
+async function main() {
+  try {
+    // 1. Connect DB
+    await mongoose.connect(process.env.MONGO_URI);
+    logger.info("✅ Connected to MongoDB");
 
-export function setupTelegram(bot, waSock) {
-  bot.on('message', async (msg) => {
-    const chatId = msg.chat.id.toString()
-    if (chatId === process.env.TELEGRAM_GROUP_ID) {
-      const text = msg.text
+    // 2. Start Telegram
+    const telegramBot = setupTelegram();
 
-      // ✅ If Telegram user is replying to a WA-forwarded message
-      if (msg.reply_to_message) {
-        const originalId = msg.reply_to_message.message_id
-        const mapping = await Mapping.findOne({ telegramMsgId: originalId })
+    // 3. Start WhatsApp (pass telegramBot if needed)
+    await startWhatsApp(telegramBot);
 
-        if (mapping) {
-          try {
-            await waSock.sendMessage(mapping.waJid, { text })
-            await bot.sendMessage(chatId, `✅ Reply sent to ${mapping.waJid}`)
-          } catch (err) {
-            console.error('❌ Failed to send reply to WA', err)
-            await bot.sendMessage(chatId, '⚠️ Failed to send reply to WhatsApp.')
-          }
-          return
-        }
-      }
+    // 4. Queue worker
+    startQueueWorker();
 
-      // ✅ If not a reply, send to default WA number
-      if (text) {
-        const targetJid = process.env.DEFAULT_WA_NUMBER + '@s.whatsapp.net'
-        try {
-          await waSock.sendMessage(targetJid, { text })
-          await bot.sendMessage(chatId, `✅ Sent to WhatsApp default: ${text}`)
-        } catch (err) {
-          console.error('❌ Failed to send to default WA number', err)
-          await bot.sendMessage(chatId, '⚠️ Failed to send message to WhatsApp.')
-        }
-      }
-    }
-  })
+    // 5. Web server
+    startServer();
+
+    // 6. Graceful shutdown
+    setupGracefulShutdown();
+  } catch (err) {
+    logger.error({ err }, "❌ Fatal error in main()");
+    process.exit(1);
+  }
 }
 
-export default bot
+main();
