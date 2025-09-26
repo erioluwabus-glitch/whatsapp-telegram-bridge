@@ -1,8 +1,17 @@
-import express from "express";
+// src/server.js
+import express from 'express';
+import logger from './logger.js';
 
-export function startServer() {
+export function startServer(port = process.env.PORT || 10000) {
   const app = express();
-  const PORT = process.env.PORT || 10000;
-  app.get("/", (req, res) => res.send("Bridge is running 🚀"));
-  app.listen(PORT, () => console.log(`🌐 Server listening on ${PORT}`));
+
+  app.get('/', (req, res) => res.send('✅ WhatsApp ↔ Telegram Bridge is running'));
+  app.get('/health', (req, res) => res.json({ ok: true }));
+
+  const server = app.listen(port, () => {
+    logger.info(`🌐 Web server started on port ${port}`);
+  });
+
+  // return server instance in case caller wants to close it later
+  return server;
 }
