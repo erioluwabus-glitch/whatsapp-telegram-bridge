@@ -1,7 +1,7 @@
 import mongoose from 'mongoose'
 import logger from './logger.js'
 import { startWhatsApp } from './whatsapp.js'
-import { setupTelegram } from './telegram.js'
+import { setupTelegram } from "./telegram.js";
 import { startQueueWorker } from './queue.js'
 import { startServer } from './server.js'
 import { setupGracefulShutdown } from './graceful.js'
@@ -50,3 +50,4 @@ async function main() {
 }
 
 main()
+
