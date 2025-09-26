@@ -1,92 +1,90 @@
-import makeWASocket, { DisconnectReason, useMultiFileAuthState } from '@whiskeysockets/baileys'
-import * as Boom from '@hapi/boom'
-import mongoose from 'mongoose'
+// src/whatsapp.js
+import makeWASocket, { DisconnectReason } from '@whiskeysockets/baileys'
+import logger from './logger.js'
 import Session from './models/Session.js'
 import Mapping from './models/Mapping.js'
 
-export async function startWhatsApp(telegramBot) {
-  // ✅ Ensure MongoDB is connected
-  if (!mongoose.connection.readyState) {
-    await mongoose.connect(process.env.MONGO_URI, {
-      useNewUrlParser: true,
-      useUnifiedTopology: true
-    })
-    console.log('✅ MongoDB connected for session + mapping storage')
+export async function startWhatsApp(tgBot, TELEGRAM_GROUP_ID) {
+  // Load saved session (if any)
+  let saved = null
+  try {
+    saved = await Session.findOne({ id: 'whatsapp-session' })
+    if (saved) logger.info('Loaded saved WhatsApp session from Mongo')
+  } catch (e) {
+    logger.warn({ e }, 'Error reading Session from Mongo (continuing without saved creds)')
   }
 
-  // ✅ Setup Baileys auth state
-  const { state, saveCreds } = await useMultiFileAuthState('./baileys_auth')
-
-  // Load saved creds from DB if they exist
-  const dbSession = await Session.findOne({ id: 'whatsapp-session' })
-  if (dbSession) {
-    Object.assign(state.creds, dbSession.data)
-    console.log('🔄 Loaded WhatsApp creds from MongoDB')
-  }
+  const auth = saved?.data || undefined
 
   const sock = makeWASocket({
-    printQRInTerminal: true,
-    auth: state
+    auth,
+    printQRInTerminal: true
   })
 
-  // ✅ Save creds into MongoDB whenever they update
+  // Persist credentials when they update
   sock.ev.on('creds.update', async () => {
-    await Session.findOneAndUpdate(
-      { id: 'whatsapp-session' },
-      { data: state.creds },
-      { upsert: true }
-    )
-    console.log('💾 WhatsApp session saved to MongoDB')
-  })
-
-  // ✅ Handle connection status
-  sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect } = update
-    if (connection === 'close') {
-      const statusCode = (lastDisconnect?.error as Boom.Boom)?.output?.statusCode
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut
-      console.log('WhatsApp disconnected, reconnect?', shouldReconnect)
-      if (shouldReconnect) startWhatsApp(telegramBot)
-    } else if (connection === 'open') {
-      console.log('✅ WhatsApp connected!')
+    try {
+      // Attempt to read credentials from known locations on the socket
+      const creds = (sock.authState && sock.authState.creds) || (sock.auth && sock.auth.creds) || {}
+      await Session.findOneAndUpdate(
+        { id: 'whatsapp-session' },
+        { data: creds, updatedAt: new Date() },
+        { upsert: true }
+      )
+      logger.info('Saved WhatsApp session to Mongo')
+    } catch (err) {
+      logger.error({ err }, 'Failed to save WhatsApp session to Mongo')
     }
   })
 
-  // ✅ Handle incoming WA messages
-  sock.ev.on('messages.upsert', async (m) => {
-    const msg = m.messages[0]
-    if (!msg.key.fromMe && m.type === 'notify') {
-      const text =
-        msg.message?.conversation || msg.message?.extendedTextMessage?.text
-      if (text) {
-        console.log(`📥 New WA message: ${text}`)
+  // Connection/reconnect handling
+  sock.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect } = update
+    logger.info({ update }, 'WA connection.update')
 
-        try {
-          // Forward to Telegram group
-          const chatId = process.env.TELEGRAM_GROUP_ID
-          const sent = await telegramBot.sendMessage(
-            chatId,
-            `From WhatsApp (${msg.key.remoteJid}):\n${text}`
-          )
-
-          // ✅ Save mapping in MongoDB (TG msgId ↔ WA sender JID)
-          await Mapping.findOneAndUpdate(
-            { telegramMsgId: sent.message_id },
-            { waJid: msg.key.remoteJid },
-            { upsert: true }
-          )
-          console.log(
-            `💾 Mapping saved: TG ${sent.message_id} ↔ WA ${msg.key.remoteJid}`
-          )
-
-          // Acknowledge delivery on WA
-          await sock.sendMessage(msg.key.remoteJid, {
-            text: '✅ Message delivered to Telegram group'
-          })
-        } catch (err) {
-          console.error('❌ Failed to forward WA → TG', err)
-        }
+    if (connection === 'close') {
+      // Use plain JS optional chaining to get the status code
+      const statusCode = lastDisconnect?.error?.output?.statusCode
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut
+      logger.info({ statusCode, shouldReconnect }, 'WA connection closed')
+      if (shouldReconnect) {
+        setTimeout(() => startWhatsApp(tgBot, TELEGRAM_GROUP_ID), 5000)
+      } else {
+        logger.warn('WA logged out — recreate session by scanning QR again')
       }
+    } else if (connection === 'open') {
+      logger.info('✅ WhatsApp connection opened')
+    }
+  })
+
+  // Incoming message handling
+  sock.ev.on('messages.upsert', async (m) => {
+    try {
+      const msg = m.messages?.[0]
+      if (!msg || msg.key?.fromMe) return
+
+      const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text
+      if (!text) return
+
+      const senderJid = msg.key.remoteJid
+      logger.info({ senderJid, text }, 'Incoming WA message')
+
+      // Forward to Telegram group
+      try {
+        const sent = await tgBot.sendMessage(TELEGRAM_GROUP_ID, `From WhatsApp (${senderJid}):\n${text}`)
+        // Save mapping: telegramMsgId -> waJid
+        await Mapping.findOneAndUpdate(
+          { telegramMsgId: sent.message_id },
+          { waJid: senderJid },
+          { upsert: true }
+        )
+        // Acknowledge on WA
+        await sock.sendMessage(senderJid, { text: '✅ Message delivered to Telegram group' })
+      } catch (err) {
+        logger.error({ err }, 'Failed to forward WA -> TG')
+      }
+    } catch (err) {
+      logger.error({ err }, 'Error in messages.upsert')
     }
   })
 
