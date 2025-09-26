@@ -2,14 +2,12 @@
 import express from 'express';
 import logger from './logger.js';
 
-/**
- * startServer - starts a tiny HTTP server so Render sees a bound port.
- * Returns the node http.Server instance so callers can close it on shutdown.
- */
-export function startServer(port = process.env.PORT || 10000) {
+export function createServer(port = process.env.PORT || 10000) {
   const app = express();
 
-  // Basic endpoints
+  // Accept JSON bodies (Telegram sends JSON)
+  app.use(express.json({ limit: '5mb' }));
+
   app.get('/', (req, res) => res.send('✅ WhatsApp ↔ Telegram Bridge is running'));
   app.get('/health', (req, res) =>
     res.json({
@@ -27,5 +25,5 @@ export function startServer(port = process.env.PORT || 10000) {
     logger.error({ err }, 'HTTP server error');
   });
 
-  return server;
+  return { app, server };
 }
