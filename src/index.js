@@ -14,6 +14,7 @@ import { setupTelegram } from "./telegram.js";
 import { startQueueWorker } from './queue.js'
 import { startServer } from './server.js'
 import { setupGracefulShutdown } from './graceful.js'
+import express from "express";
 
 // === 1. Connect to MongoDB Atlas ===
 async function connectMongo() {
@@ -58,6 +59,14 @@ async function main() {
   }
 }
 
+export function startServer() {
+  const app = express();
+  const PORT = process.env.PORT || 10000;
+  app.get("/", (req, res) => res.send("Bridge is running 🚀"));
+  app.listen(PORT, () => console.log(`🌐 Server listening on ${PORT}`));
+}
+
 main()
+
 
 
