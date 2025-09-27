@@ -200,14 +200,6 @@ export async function startWhatsApp({ authDir = './baileys_auth', publicDir = '.
     }
   });
 
-  // return the socket (or any handlers you need)
-  return {
-    sock,
-    // you may expose the handleTelegramUpdate implementation here, or integrate with your telegram.js
-    handleTelegramUpdate: (update) => { /* optionally forward/update logic */ },
-  };
-}
-
   // persist on creds.update
   sock.ev.on("creds.update", async () => {
     try {
@@ -315,7 +307,11 @@ export async function startWhatsApp({ authDir = './baileys_auth', publicDir = '.
 
       if (msg.reply_to_message && msg.reply_to_message.message_id) {
         const replyToId = msg.reply_to_message.message_id;
-        const mapping = await MessageMap.findOne({ telegramChatId: String(msg.chat?.id), telegramMessageId: replyToId }).sort({ createdAt: -1 });
+        const mapping = await MessageMap.findOne({ 
+          telegramChatId: String(msg.chat?.id), 
+          telegramMessageId: replyToId 
+        }).sort({ createdAt: -1 });
+
         if (!mapping) {
           console.info("No mapping found for telegram reply -> not a WA-forwarded message.");
           return;
@@ -328,10 +324,11 @@ export async function startWhatsApp({ authDir = './baileys_auth', publicDir = '.
 
         const botToken = process.env.TELEGRAM_TOKEN;
         if (botToken) {
-          await telegramSendRaw(botToken, msg.chat.id, { text: `✅ Delivered reply to WhatsApp (to ${mapping.waChatId})`, reply_to_message_id: msg.message_id });
+          await telegramSendRaw(botToken, msg.chat.id, { 
+            text: `✅ Delivered reply to WhatsApp (to ${mapping.waChatId})`, 
+            reply_to_message_id: msg.message_id 
+          });
         }
-      } else {
-        // ignore non-replies
       }
     } catch (err) {
       console.error("handleTelegramUpdate error:", err);
@@ -347,10 +344,19 @@ export async function startWhatsApp({ authDir = './baileys_auth', publicDir = '.
     }
   }
 
-  // done — call onReady so orchestrator can hook the Telegram handler
-  onReady({ sock, sendTextToJid: async (jid, text) => sock.sendMessage(jid, { text }), handleTelegramUpdate, persistAuthFilesToMongo: persistNow });
+  // call orchestrator hook (index.js wires this to Telegram)
+  onReady({ 
+    sock, 
+    sendTextToJid: async (jid, text) => sock.sendMessage(jid, { text }), 
+    handleTelegramUpdate, 
+    persistAuthFilesToMongo: persistNow 
+  });
 
-  // return public API
-  return { sock, handleTelegramUpdate, persistAuthFilesToMongo: persistNow, clearAuthFromMongoAndDisk };
+  // ✅ return once, at the end
+  return { 
+    sock, 
+    handleTelegramUpdate, 
+    persistAuthFilesToMongo: persistNow, 
+    clearAuthFromMongoAndDisk 
+  };
 }
-
