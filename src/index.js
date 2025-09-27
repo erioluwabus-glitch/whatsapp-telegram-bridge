@@ -31,17 +31,25 @@ async function main() {
   await mongoose.connect(process.env.MONGO_URI);
   logger.info("✅ Connected to MongoDB");
 
-  // start WA (will restore auth from Mongo if present)
+  //  WA (will restore auth from Mongo if present)
+    // start WA (will restore auth from Mongo if present)
   const wa = await startWhatsApp({
     telegram: { token: process.env.TELEGRAM_TOKEN, chatId: process.env.TELEGRAM_CHAT_ID },
     authDir: AUTH_DIR,
     publicDir: PUBLIC_DIR,
+    // NEW: give whatsapp-specific options (browser + version + maxReconnectAttempts)
+    whatsappOptions: {
+      browser: ['Chrome', 'Windows', '10'],        // present as a normal browser
+      version: [2, 2413, 12],                      // reasonable WA web version array
+      maxReconnectAttempts: 5                      // try reconnect 5x before clearing
+    },
     onReady: ({ handleTelegramUpdate }) => {
       // wire Telegram webhook handler into server
       setTelegramWebhookHandler(handleTelegramUpdate);
       logger.info("✅ Telegram webhook handler attached to server (will forward Telegram replies to WhatsApp)");
     },
   });
+
 
   // If you provided WEBHOOK_BASE_URL, set it in Telegram so Telegram calls your /telegram/<TOKEN> endpoint
   if (process.env.WEBHOOK_BASE_URL && process.env.TELEGRAM_TOKEN) {
@@ -75,3 +83,4 @@ main().catch((err) => {
   console.error("Fatal startup error:", err);
   process.exit(1);
 });
+
