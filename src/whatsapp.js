@@ -123,8 +123,9 @@ async function telegramSendRaw(botToken, chatId, payload) {
  *   - telegram: { token, chatId }
  *   - authDir, publicDir
  *   - onReady callback
+ *   - serverUtils
  */
-export async function startWhatsApp({ authDir = './baileys_auth', publicDir = './public', telegram = {}, onReady = () => {}, whatsappOptions = {} }) {
+export async function startWhatsApp({ authDir = './baileys_auth', publicDir = './public', telegram = {}, onReady = () => {}, whatsappOptions = {}, serverUtils = {} }) {
   // ensure publicDir exists
   if (!fsSync.existsSync(publicDir)) fsSync.mkdirSync(publicDir, { recursive: true });
 
@@ -164,6 +165,8 @@ export async function startWhatsApp({ authDir = './baileys_auth', publicDir = '.
         const qrPath = path.join(publicDir, "qr.png");
         await qrcode.toFile(qrPath, qr, { width: 640 }).catch((err) => console.error("qrcode.toFile error:", err));
         console.info("WA QR updated -> public/qr.png (open your service URL /qr.png)");
+        serverUtils.setLatestQr(qr); // save QR for /qr route
+        console.log("📲 New QR generated. Open /qr to scan.");
       }
 
       if (connection === "open") {
