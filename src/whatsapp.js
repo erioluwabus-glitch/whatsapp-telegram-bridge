@@ -4,8 +4,8 @@ import fsSync from "fs";
 import path from "path";
 import crypto from "crypto";
 import qrcode from "qrcode";
-import { makeWASocket, useMultiFileAuthState } from "@whiskeysockets/baileys";
 import mongoose from "mongoose";
+import makeWASocket, { useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys';
 
 // ---------- Mongoose models ----------
 const AuthFileSchema = new mongoose.Schema({
@@ -124,33 +124,89 @@ async function telegramSendRaw(botToken, chatId, payload) {
  *   - authDir, publicDir
  *   - onReady callback
  */
-export async function startWhatsApp(options = {}) {
-  const {
-    telegram = { token: process.env.TELEGRAM_TOKEN, chatId: process.env.TELEGRAM_CHAT_ID },
-    authDir = "./baileys_auth",
-    publicDir = "./public",
-    onReady = () => {},
-  } = options;
+export async function startWhatsApp({ authDir = './baileys_auth', publicDir = './public', telegram = {}, onReady = () => {}, whatsappOptions = {} }) {
+  // ensure publicDir exists
+  if (!fs.existsSync(publicDir)) fs.mkdirSync(publicDir, { recursive: true });
 
-  // ensure folders exist
-  await ensureDir(authDir);
-  await ensureDir(publicDir);
-
-  // restore auth files from Mongo so useMultiFileAuthState picks them up
-  await restoreAuthFilesFromMongo(authDir).catch((err) => {
-    console.warn("restoreAuthFilesFromMongo failed:", err);
-  });
-
-  // create multi-file auth state (Baileys will keep files in authDir)
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
-  // create socket
+  // Use provided options or sane defaults
+  const browser = whatsappOptions.browser || ['Chrome', 'Windows', '10'];
+  const version = whatsappOptions.version || [2, 2413, 12];
+  const maxReconnectAttempts = whatsappOptions.maxReconnectAttempts || 5;
+
+  let reconnectAttempts = 0;
+
   const sock = makeWASocket({
     auth: state,
     printQRInTerminal: false,
-    browser: ["Render", "Bridge", "1.0"],
-    // version can be left default or adjusted if you know a specific tuple you need
+    browser,
+    version,
   });
+
+  // persist credentials
+  sock.ev.on('creds.update', saveCreds);
+
+  // helper to write QR to public/qr.png
+  async function writeQr(qr) {
+    try {
+      const qrPath = path.join(publicDir, 'qr.png');
+      await qrcode.toFile(qrPath, qr, { width: 300 });
+      console.log('WA QR updated ->', qrPath);
+    } catch (e) {
+      console.error('Failed to write QR file', e);
+    }
+  }
+
+  // connection updates
+  sock.ev.on('connection.update', async (update) => {
+    // QR provided
+    if (update.qr) await writeQr(update.qr);
+
+    const { connection, lastDisconnect } = update;
+
+    if (connection === 'open') {
+      reconnectAttempts = 0;
+      console.log('WhatsApp connected (open).');
+      // expose handler for Telegram wiring once connected
+      if (onReady) {
+        // pass any helper(s) needed by your telegram adapter. For example:
+        onReady({ handleTelegramUpdate: (u) => {/* implement or call your telegram handler */} });
+      }
+    } else if (connection === 'close') {
+      const code = lastDisconnect?.error?.output?.statusCode;
+      console.warn('WhatsApp connection closed', code);
+
+      // If code is 401 => session invalid
+      if (code === 401) {
+        reconnectAttempts++;
+        if (reconnectAttempts <= maxReconnectAttempts) {
+          const backoff = reconnectAttempts * 2000;
+          console.warn(`401 received — attempt reconnect #${reconnectAttempts} in ${backoff}ms`);
+          setTimeout(() => {
+            // try to re-establish connection by re-creating socket (let Node GC old)
+            startWhatsApp({ authDir, publicDir, telegram, onReady, whatsappOptions });
+          }, backoff);
+          return;
+        } else {
+          console.error('Persistent 401 after reconnect attempts. *Do not auto-clear auth*. Please clear session in MongoDB Atlas (or allow me to do it for you) and then re-deploy / re-run to generate a fresh QR.');
+          // signal for manual intervention: do NOT automatically clear data here (safer).
+          return;
+        }
+      }
+
+      // other closes: Baileys will attempt auto-reconnect internally; log it.
+      console.warn('Connection closed (non-401). Baileys will auto-reconnect when possible.');
+    }
+  });
+
+  // return the socket (or any handlers you need)
+  return {
+    sock,
+    // you may expose the handleTelegramUpdate implementation here, or integrate with your telegram.js
+    handleTelegramUpdate: (update) => { /* optionally forward/update logic */ },
+  };
+}
 
   // persist on creds.update
   sock.ev.on("creds.update", async () => {
@@ -297,3 +353,4 @@ export async function startWhatsApp(options = {}) {
   // return public API
   return { sock, handleTelegramUpdate, persistAuthFilesToMongo: persistNow, clearAuthFromMongoAndDisk };
 }
+
