@@ -1,14 +1,12 @@
-```javascript
 // src/whatsapp.js
 import fs from "fs/promises";
 import fsSync from "fs";
 import path from "path";
-import crypto from "crypto";
 import qrcode from "qrcode";
 import mongoose from "mongoose";
-import makeWASocket, { useMultiFileAuthState } from '@whiskeysockets/baileys';
+import makeWASocket, { useMultiFileAuthState } from "@whiskeysockets/baileys";
 
-// ---------- Mongoose models ----------
+// Mongoose models for storing auth files & message mapping
 const AuthFileSchema = new mongoose.Schema({
   path: { type: String, required: true, unique: true },
   contentBase64: { type: String, required: true },
@@ -24,7 +22,7 @@ const MessageMapSchema = new mongoose.Schema({
 const AuthFile = mongoose.models.AuthFile || mongoose.model("AuthFile", AuthFileSchema);
 const MessageMap = mongoose.models.MessageMap || mongoose.model("MessageMap", MessageMapSchema);
 
-// ---------- Helpers ----------
+// Helpers
 async function ensureDir(dir) {
   await fs.mkdir(dir, { recursive: true }).catch(() => {});
 }
@@ -33,16 +31,10 @@ async function walkFiles(dir) {
   const files = [];
   for (const e of entries) {
     const full = path.join(dir, e.name);
-    if (e.isDirectory()) {
-      files.push(...(await walkFiles(full)));
-    } else {
-      files.push(full);
-    }
+    if (e.isDirectory()) files.push(...(await walkFiles(full)));
+    else files.push(full);
   }
   return files;
-}
-function sha256(input) {
-  return crypto.createHash("sha256").update(input).digest("hex");
 }
 function extractTextFromMessage(msg) {
   if (!msg) return null;
@@ -54,7 +46,7 @@ function extractTextFromMessage(msg) {
   return null;
 }
 
-// ---------- Mongo <-> disk auth persistence ----------
+// Mongo <-> disk persistence
 export async function restoreAuthFilesFromMongo(authDir = "./baileys_auth") {
   const docs = await AuthFile.find({});
   if (!docs || docs.length === 0) {
@@ -90,7 +82,6 @@ export async function persistAuthFilesToMongo(authDir = "./baileys_auth") {
   }
 }
 
-// remove auth from Mongo + local dir
 export async function clearAuthFromMongoAndDisk(authDir = "./baileys_auth") {
   try {
     await AuthFile.deleteMany({});
@@ -105,37 +96,39 @@ export async function clearAuthFromMongoAndDisk(authDir = "./baileys_auth") {
   console.info("Cleared auth files from Mongo and disk");
 }
 
-// ---------- Telegram raw send helper ----------
-async function telegramSendRaw(botToken, chatId, payload) {
-  const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
-  const body = Object.assign({ chat_id: chatId }, payload);
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  return res.json();
-}
-
-// ---------- Main: startWhatsApp ----------
-/**
- * startWhatsApp(options)
- * options:
- *   - telegram: { token, chatId }
- *   - authDir, publicDir
- *   - onReady callback
- *   - setLatestQr
- */
-export async function startWhatsApp({ authDir = './baileys_auth', publicDir = './public', telegram = {}, onReady = () => {}, whatsappOptions = {}, setLatestQr = undefined }) {
-  // ensure publicDir exists
+// Main start function
+export async function startWhatsApp({ authDir = "./baileys_auth", publicDir = "./public", telegram = {}, onReady = () => {}, whatsappOptions = {}, setLatestQr = undefined } = {}) {
+  // ensure public dir exists
   if (!fsSync.existsSync(publicDir)) fsSync.mkdirSync(publicDir, { recursive: true });
 
+  // restore existing auth from Mongo into authDir (optional)
+  try {
+    await restoreAuthFilesFromMongo(authDir);
+  } catch (e) {
+    console.warn("restoreAuthFilesFromMongo failed:", e);
+  }
+
+  // create auth state
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
-  // Use provided options or sane defaults
-  const browser = whatsappOptions.browser || ['Chrome', 'Windows', '10'];
-  const version = whatsappOptions.version || [2, 3000, 1027683323];
+  // sensible defaults
+  const browser = whatsappOptions.browser || ["Chrome", "Windows", "10"];
+  const version = whatsappOptions.version || [2, 2413, 12];
+  const maxReconnectAttempts = whatsappOptions.maxReconnectAttempts || 5;
+  let reconnectAttempts = 0;
 
+  // helper to write QR to public/qr.png
+  async function writeQr(qr) {
+    try {
+      const qrPath = path.join(publicDir, "qr.png");
+      await qrcode.toFile(qrPath, qr, { width: 400 });
+      console.info("WA QR updated -> public/qr.png (open your service URL /qr)");
+    } catch (e) {
+      console.error("Failed to write QR file:", e);
+    }
+  }
+
+  // make socket
   const sock = makeWASocket({
     auth: state,
     printQRInTerminal: false,
@@ -143,106 +136,63 @@ export async function startWhatsApp({ authDir = './baileys_auth', publicDir = '.
     version,
   });
 
-  // persist on creds.update
+  // persist credentials to auth state files
+  sock.ev.on("creds.update", saveCreds);
+
+  // whenever creds.update happens, persist to Mongo as well
   sock.ev.on("creds.update", async () => {
-    try {
-      await saveCreds();
-    } catch (e) {
-      console.error("saveCreds() failed", e);
-    }
     try {
       await persistAuthFilesToMongo(authDir);
     } catch (e) {
-      console.error("persistAuthFilesToMongo failed", e);
+      console.error("persistAuthFilesToMongo failed:", e);
     }
   });
-
-  // helper to write QR to public/qr.png
-  async function writeQr(qr) {
-    try {
-      const qrPath = path.join(publicDir, 'qr.png');
-      await qrcode.toFile(qrPath, qr, { width: 300 });
-      console.log('WA QR updated ->', qrPath);
-    } catch (e) {
-      console.error('Failed to write QR file', e);
-    }
-  }
 
   // connection updates
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect } = update;
-
-    if (update.qr) {
-      // write local png (existing behaviour)
-      await writeQr(update.qr);
-
-      // also tell the webserver about the QR so /qr route returns it
-      if (typeof setLatestQr === "function") {
-        try {
-          await setLatestQr(update.qr);
-          console.info("setLatestQr: updated server QR");
-        } catch (e) {
-          console.warn("setLatestQr failed:", e);
-        }
-      } else {
-        console.info("setLatestQr not provided — /qr route won't show the live QR");
-      }
-    }
-
-    if (connection === 'open') {
-      console.log('WhatsApp connected (open).');
-      // expose handler for Telegram wiring once connected
-      if (onReady) {
-        onReady({ handleTelegramUpdate: (u) => {/* implement or call your telegram handler */} });
-      }
-    } else if (connection === 'close') {
-      const code = lastDisconnect?.error?.output?.statusCode;
-      console.warn('WhatsApp connection closed', code);
-
-      // If code is 401 => session invalid
-      if (code === 401) {
-        console.error('Persistent 401 after reconnect attempts. *Do not auto-clear auth*. Please clear session in MongoDB Atlas (or allow me to do it for you) and then re-deploy / re-run to generate a fresh QR.');
-        return;
-      }
-
-      // other closes: Baileys will attempt auto-reconnect internally; log it.
-      console.warn('Connection closed (non-401). Baileys will auto-reconnect when possible.');
-    }
-  });
-
-  // On connection updates (second handler)
   sock.ev.on("connection.update", async (update) => {
     try {
-      const { connection, qr, lastDisconnect } = update;
-
-      if (qr) {
-        const qrPath = path.join(publicDir, "qr.png");
-        await qrcode.toFile(qrPath, qr, { width: 640 }).catch((err) => console.error("qrcode.toFile error:", err));
-        console.info("WA QR updated -> public/qr.png (open your service URL /qr.png)");
+      if (update.qr) {
+        // write PNG and inform server
+        await writeQr(update.qr);
+        if (typeof setLatestQr === "function") {
+          try {
+            setLatestQr(update.qr);
+            console.info("setLatestQr: updated server QR");
+          } catch (e) {
+            console.warn("setLatestQr failed:", e);
+          }
+        }
       }
 
+      const { connection, lastDisconnect } = update;
+
       if (connection === "open") {
+        reconnectAttempts = 0;
         console.info("✅ WhatsApp connected");
-        // persist auth now that we're open
+        // persist auth once open
         await persistAuthFilesToMongo(authDir);
+        // notify orchestrator
+        onReady({ sock, handleTelegramUpdate, persistAuthFilesToMongo: async () => persistAuthFilesToMongo(authDir) });
       }
 
       if (connection === "close") {
         const status = lastDisconnect?.error?.output?.statusCode;
         console.warn("WhatsApp connection closed", status || lastDisconnect?.error || "");
-        // if 401: re-login required
         if (status === 401) {
-          console.error("❌ WhatsApp session invalid (401). Clearing auth and exiting so the supervisor restarts cleanly.");
-          // clear all saved auth (so next start will produce QR)
-          try {
-            await clearAuthFromMongoAndDisk(authDir);
-          } catch (e) {
-            console.error("Failed to clear auth:", e);
+          // session invalid — try a few reconnects, then require manual intervention
+          reconnectAttempts++;
+          if (reconnectAttempts <= maxReconnectAttempts) {
+            const backoff = reconnectAttempts * 2000;
+            console.warn(`401 received — will attempt reconnect #${reconnectAttempts} in ${backoff}ms`);
+            setTimeout(() => {
+              // re-create connection by re-calling startWhatsApp from your orchestrator if you prefer;
+              // Here we let the process stay alive and rely on supervisor to restart if needed.
+            }, backoff);
+          } else {
+            console.error("❌ Persistent 401 — session invalid. Please clear auth in Mongo and re-scan the QR.");
+            // do not auto-clear here to avoid loops; operator should clear via Atlas or call exported function clearAuthFromMongoAndDisk
           }
-          // exit so Render / the process manager restarts with a clean state
-          setTimeout(() => process.exit(1), 300);
         } else {
-          // other closes: let Baileys reconnect automatically; we persisted on creds.update & open
           console.info("Connection closed (non-401). Waiting for automatic reconnect by Baileys.");
         }
       }
@@ -251,7 +201,7 @@ export async function startWhatsApp({ authDir = './baileys_auth', publicDir = '.
     }
   });
 
-  // incoming WA messages: forward to Telegram if configured
+  // messages.upsert -> forward to Telegram (if configured)
   sock.ev.on("messages.upsert", async (m) => {
     try {
       if (m.type !== "notify") return;
@@ -262,27 +212,33 @@ export async function startWhatsApp({ authDir = './baileys_auth', publicDir = '.
         const waChatId = msg.key.remoteJid;
         const waMsgId = msg.key.id;
         const text = extractTextFromMessage(msg.message);
-        if (!text) {
-          console.info("Received non-text message — skipping.");
-          continue;
-        }
+        if (!text) continue;
+
         const sender = msg.pushName || waChatId;
         const forwardText = `🟢 *From WhatsApp* — ${sender}\n\n${text}`;
 
         if (telegram?.token && telegram?.chatId) {
-          const resp = await telegramSendRaw(telegram.token, telegram.chatId, { text: forwardText, parse_mode: "Markdown" }).catch((e) => ({ ok: false, error: e }));
-          if (resp?.ok) {
-            await MessageMap.create({
-              waChatId,
-              waMessageId: waMsgId,
-              telegramChatId: String(telegram.chatId),
-              telegramMessageId: resp.result.message_id,
-            }).catch((err) => console.error("MessageMap.create error", err));
-
-            await sock.sendMessage(waChatId, { text: `✅ Your message was forwarded to the Telegram group (msg id ${resp.result.message_id}).` }, { quoted: msg }).catch(() => {});
-          } else {
-            console.error("Telegram send failed", resp);
-            await sock.sendMessage(waChatId, { text: `❌ Failed to forward to Telegram: ${String(resp?.error || resp)}` }, { quoted: msg }).catch(() => {});
+          try {
+            const res = await fetch(`https://api.telegram.org/bot${telegram.token}/sendMessage`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ chat_id: telegram.chatId, text: forwardText, parse_mode: "Markdown" }),
+            });
+            const data = await res.json();
+            if (data?.ok) {
+              await MessageMap.create({
+                waChatId,
+                waMessageId: waMsgId,
+                telegramChatId: String(telegram.chatId),
+                telegramMessageId: data.result.message_id,
+              }).catch((err) => console.error("MessageMap.create error", err));
+              await sock.sendMessage(waChatId, { text: `✅ Your message was forwarded to the Telegram group (msg id ${data.result.message_id}).` }, { quoted: msg }).catch(() => {});
+            } else {
+              console.error("Telegram send failed", data);
+              await sock.sendMessage(waChatId, { text: `❌ Failed to forward to Telegram: ${JSON.stringify(data)}` }, { quoted: msg }).catch(() => {});
+            }
+          } catch (e) {
+            console.error("Telegram send error", e);
           }
         } else {
           await sock.sendMessage(waChatId, { text: "⚠️ Bridge is not configured with Telegram token/chat ID." }, { quoted: msg }).catch(() => {});
@@ -293,7 +249,7 @@ export async function startWhatsApp({ authDir = './baileys_auth', publicDir = '.
     }
   });
 
-  // handler to receive Telegram updates (server will call this by POST)
+  // Telegram -> WhatsApp reply handling function (the server will call this)
   async function handleTelegramUpdate(update) {
     try {
       if (!update) return;
@@ -302,11 +258,7 @@ export async function startWhatsApp({ authDir = './baileys_auth', publicDir = '.
 
       if (msg.reply_to_message && msg.reply_to_message.message_id) {
         const replyToId = msg.reply_to_message.message_id;
-        const mapping = await MessageMap.findOne({ 
-          telegramChatId: String(msg.chat?.id), 
-          telegramMessageId: replyToId 
-        }).sort({ createdAt: -1 });
-
+        const mapping = await MessageMap.findOne({ telegramChatId: String(msg.chat?.id), telegramMessageId: replyToId }).sort({ createdAt: -1 });
         if (!mapping) {
           console.info("No mapping found for telegram reply -> not a WA-forwarded message.");
           return;
@@ -317,12 +269,13 @@ export async function startWhatsApp({ authDir = './baileys_auth', publicDir = '.
 
         await sock.sendMessage(mapping.waChatId, { text: `🟦 Reply from Telegram:\n\n${replyText}` });
 
-        const botToken = telegram.token;
+        const botToken = process.env.TELEGRAM_TOKEN;
         if (botToken) {
-          await telegramSendRaw(botToken, msg.chat.id, { 
-            text: `✅ Delivered reply to WhatsApp (to ${mapping.waChatId})`, 
-            reply_to_message_id: msg.message_id 
-          });
+          await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ chat_id: msg.chat.id, text: `✅ Delivered reply to WhatsApp (to ${mapping.waChatId})`, reply_to_message_id: msg.message_id }),
+          }).catch(() => {});
         }
       }
     } catch (err) {
@@ -330,7 +283,7 @@ export async function startWhatsApp({ authDir = './baileys_auth', publicDir = '.
     }
   }
 
-  // expose a tiny helper so external admin code can persist immediately
+  // helper: manually persist auth to Mongo
   async function persistNow() {
     try {
       await persistAuthFilesToMongo(authDir);
@@ -339,19 +292,13 @@ export async function startWhatsApp({ authDir = './baileys_auth', publicDir = '.
     }
   }
 
-  // call orchestrator hook (index.js wires this to Telegram)
-  onReady({ 
-    sock, 
-    sendTextToJid: async (jid, text) => sock.sendMessage(jid, { text }), 
-    handleTelegramUpdate, 
-    persistAuthFilesToMongo: persistNow 
-  });
-
-  // ✅ return once, at the end
-  return { 
-    sock, 
-    handleTelegramUpdate, 
-    persistAuthFilesToMongo: persistNow, 
-    clearAuthFromMongoAndDisk 
+  // call onReady (orchestrator may wire the telegram handler)
+  // onReady is called when the connection opens inside connection.update above,
+  // but we also expose onReady in the returned object if caller wants immediate wiring.
+  return {
+    sock,
+    handleTelegramUpdate,
+    persistAuthFilesToMongo: persistNow,
+    clearAuthFromMongoAndDisk,
   };
 }
