@@ -1,3 +1,4 @@
+```javascript
 // src/whatsapp.js
 import fs from "fs/promises";
 import fsSync from "fs";
@@ -123,9 +124,9 @@ async function telegramSendRaw(botToken, chatId, payload) {
  *   - telegram: { token, chatId }
  *   - authDir, publicDir
  *   - onReady callback
- *   - serverUtils
+ *   - setLatestQr
  */
-export async function startWhatsApp({ authDir = './baileys_auth', publicDir = './public', telegram = {}, onReady = () => {}, whatsappOptions = {}, serverUtils = {} }) {
+export async function startWhatsApp({ authDir = './baileys_auth', publicDir = './public', telegram = {}, onReady = () => {}, whatsappOptions = {}, setLatestQr = undefined }) {
   // ensure publicDir exists
   if (!fsSync.existsSync(publicDir)) fsSync.mkdirSync(publicDir, { recursive: true });
 
@@ -156,7 +157,60 @@ export async function startWhatsApp({ authDir = './baileys_auth', publicDir = '.
     }
   });
 
-  // On connection updates
+  // helper to write QR to public/qr.png
+  async function writeQr(qr) {
+    try {
+      const qrPath = path.join(publicDir, 'qr.png');
+      await qrcode.toFile(qrPath, qr, { width: 300 });
+      console.log('WA QR updated ->', qrPath);
+    } catch (e) {
+      console.error('Failed to write QR file', e);
+    }
+  }
+
+  // connection updates
+  sock.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect } = update;
+
+    if (update.qr) {
+      // write local png (existing behaviour)
+      await writeQr(update.qr);
+
+      // also tell the webserver about the QR so /qr route returns it
+      if (typeof setLatestQr === "function") {
+        try {
+          await setLatestQr(update.qr);
+          console.info("setLatestQr: updated server QR");
+        } catch (e) {
+          console.warn("setLatestQr failed:", e);
+        }
+      } else {
+        console.info("setLatestQr not provided — /qr route won't show the live QR");
+      }
+    }
+
+    if (connection === 'open') {
+      console.log('WhatsApp connected (open).');
+      // expose handler for Telegram wiring once connected
+      if (onReady) {
+        onReady({ handleTelegramUpdate: (u) => {/* implement or call your telegram handler */} });
+      }
+    } else if (connection === 'close') {
+      const code = lastDisconnect?.error?.output?.statusCode;
+      console.warn('WhatsApp connection closed', code);
+
+      // If code is 401 => session invalid
+      if (code === 401) {
+        console.error('Persistent 401 after reconnect attempts. *Do not auto-clear auth*. Please clear session in MongoDB Atlas (or allow me to do it for you) and then re-deploy / re-run to generate a fresh QR.');
+        return;
+      }
+
+      // other closes: Baileys will attempt auto-reconnect internally; log it.
+      console.warn('Connection closed (non-401). Baileys will auto-reconnect when possible.');
+    }
+  });
+
+  // On connection updates (second handler)
   sock.ev.on("connection.update", async (update) => {
     try {
       const { connection, qr, lastDisconnect } = update;
@@ -165,8 +219,6 @@ export async function startWhatsApp({ authDir = './baileys_auth', publicDir = '.
         const qrPath = path.join(publicDir, "qr.png");
         await qrcode.toFile(qrPath, qr, { width: 640 }).catch((err) => console.error("qrcode.toFile error:", err));
         console.info("WA QR updated -> public/qr.png (open your service URL /qr.png)");
-        serverUtils.setLatestQr(qr); // save QR for /qr route
-        console.log("📲 New QR generated. Open /qr to scan.");
       }
 
       if (connection === "open") {
