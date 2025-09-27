@@ -1,72 +1,77 @@
 // src/index.js
 import mongoose from "mongoose";
 import { startServer } from "./server.js";
-import { createTelegram } from "./telegram.js";
-import { startWhatsApp } from "./whatsapp.js"; // your existing WA module (must return handleTelegramUpdate)
-import logger from "./logger.js"; // or replace with console
+import { startWhatsApp } from "./whatsapp.js";
+import fetch from "node-fetch"; // not required on Node 18+, but harmless if present
 
-const ENV = process.env;
+// simple logger (you can replace with your logger module)
+const logger = {
+  info: (...args) => console.log(JSON.stringify({ level: "info", time: new Date().toISOString(), msg: args.join(" ") })),
+  warn: (...args) => console.warn(JSON.stringify({ level: "warn", time: new Date().toISOString(), msg: args.join(" ") })),
+  error: (...args) => console.error(JSON.stringify({ level: "error", time: new Date().toISOString(), msg: args.join(" ") })),
+};
 
 async function main() {
-  logger?.info?.("🔍 Checking required environment variables...");
-  if (!ENV.MONGO_URI) throw new Error("❌ MONGO_URI is required");
-  if (!ENV.TELEGRAM_TOKEN) logger?.warn?.("⚠️ TELEGRAM_TOKEN not set; Telegram will be disabled.");
-
-  const PORT = ENV.PORT ? Number(ENV.PORT) : 10000;
-  const PUBLIC_DIR = ENV.PUBLIC_DIR || "./public";
-
-  // start server early so webhook endpoint exists before we ask Telegram to set it
-  const { app, server, setTelegramWebhookHandler } = startServer({ publicDir: PUBLIC_DIR, port: PORT });
-
-  // connect mongo
-  logger?.info?.("🟦 Connecting to MongoDB...");
-  await mongoose.connect(ENV.MONGO_URI);
-  logger?.info?.("✅ Connected to MongoDB");
-
-  // Telegram helper (no external library)
-  const telegram = createTelegram({ token: ENV.TELEGRAM_TOKEN, chatId: ENV.TELEGRAM_CHAT_ID });
-
-  // Start WhatsApp module. The WA module should expose a function that when called returns
-  // an object including handleTelegramUpdate (the function that expects a Telegram update object).
-  // In your existing whatsapp.js you already implemented `handleTelegramUpdate(update)`.
-  const wa = await startWhatsApp({
-    // pass options if your startWhatsApp supports them
-  });
-
-  // wait until we have the handler for Telegram replies -> WhatsApp
-  if (!wa?.handleTelegramUpdate) {
-    logger?.warn?.("⚠️ startWhatsApp did not return handleTelegramUpdate. Ensure whatsapp.js exports/returns it.");
-  } else {
-    // attach the handler into server via our telegram wrapper
-    const webhookHandler = telegram.createWebhookHandler(async (update) => {
-      // Optionally do pre-processing here then pass to WA handler
-      try {
-        await wa.handleTelegramUpdate(update);
-      } catch (err) {
-        console.error("Error in WA handleTelegramUpdate:", err);
-        throw err;
-      }
-    });
-
-    setTelegramWebhookHandler(webhookHandler);
-
-    // If WEBHOOK_BASE_URL present, set webhook on Telegram
-    if (ENV.WEBHOOK_BASE_URL) {
-      try {
-        await telegram.setWebhook(ENV.WEBHOOK_BASE_URL);
-        logger?.info?.("✅ Telegram webhook configured:", `${ENV.WEBHOOK_BASE_URL.replace(/\/$/, "")}/telegram/${telegram.token}`);
-      } catch (err) {
-        logger?.warn?.("Failed to set Telegram webhook (see logs). You can set it manually to:", `${ENV.WEBHOOK_BASE_URL.replace(/\/$/, "")}/telegram/${telegram.token}`);
-      }
-    } else {
-      logger?.info?.("ℹ️ WEBHOOK_BASE_URL not set — webhook not registered automatically. Use polling disabled mode or manually set webhook to /telegram/<TOKEN>.");
-    }
+  logger.info("🔍 Checking required environment variables...");
+  if (!process.env.MONGO_URI) {
+    logger.error("❌ MONGO_URI missing — aborting");
+    process.exit(1);
   }
 
-  logger?.info?.("🚀 Bridge started successfully — ready to forward messages.");
+  const PUBLIC_DIR = process.env.PUBLIC_DIR || "./public";
+  const AUTH_DIR = process.env.WHATSAPP_AUTH_DIR || "./baileys_auth";
+  const PORT = process.env.PORT ? Number(process.env.PORT) : 10000;
+  const ADMIN_SECRET = process.env.ADMIN_SECRET || null;
+
+  // start web server early
+  const { app, server, setTelegramWebhookHandler } = startServer({ publicDir: PUBLIC_DIR, port: PORT, adminSecret: ADMIN_SECRET });
+
+  // connect to mongo
+  logger.info("🟦 Connecting to MongoDB...");
+  await mongoose.connect(process.env.MONGO_URI);
+  logger.info("✅ Connected to MongoDB");
+
+  // start WA (will restore auth from Mongo if present)
+  const wa = await startWhatsApp({
+    telegram: { token: process.env.TELEGRAM_TOKEN, chatId: process.env.TELEGRAM_CHAT_ID },
+    authDir: AUTH_DIR,
+    publicDir: PUBLIC_DIR,
+    onReady: ({ handleTelegramUpdate }) => {
+      // wire Telegram webhook handler into server
+      setTelegramWebhookHandler(handleTelegramUpdate);
+      logger.info("✅ Telegram webhook handler attached to server (will forward Telegram replies to WhatsApp)");
+    },
+  });
+
+  // If you provided WEBHOOK_BASE_URL, set it in Telegram so Telegram calls your /telegram/<TOKEN> endpoint
+  if (process.env.WEBHOOK_BASE_URL && process.env.TELEGRAM_TOKEN) {
+    const base = String(process.env.WEBHOOK_BASE_URL).replace(/\/$/, "");
+    const webhookUrl = `${base}/telegram/${process.env.TELEGRAM_TOKEN}`;
+    try {
+      const res = await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_TOKEN}/setWebhook`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: webhookUrl, allowed_updates: ["message", "edited_message"] }),
+      });
+      const data = await res.json();
+      if (data?.ok) {
+        logger.info("✅ Telegram webhook set successfully", webhookUrl);
+      } else {
+        logger.warn("⚠️ Telegram setWebhook response:", JSON.stringify(data));
+      }
+    } catch (err) {
+      logger.warn("Failed to set Telegram webhook:", err);
+      logger.info(`Manual webhook URL (set in BotFather or Telegram API): ${webhookUrl}`);
+    }
+  } else {
+    logger.info("WEBHOOK_BASE_URL not set — skipping automatic Telegram webhook registration.");
+  }
+
+  logger.info("🚀 Bridge started successfully — ready to forward messages.");
 }
 
+// start
 main().catch((err) => {
-  console.error("❌ Fatal error starting app", err);
+  console.error("Fatal startup error:", err);
   process.exit(1);
 });
