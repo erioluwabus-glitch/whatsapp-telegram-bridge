@@ -1,29 +1,18 @@
 // src/server.js
 import express from 'express';
+import bodyParser from 'body-parser';
 import logger from './logger.js';
 
-export function createServer(port = process.env.PORT || 10000) {
+export function startServer() {
   const app = express();
+  app.use(bodyParser.json({ limit: '5mb' }));
 
-  // Accept JSON bodies (Telegram sends JSON)
-  app.use(express.json({ limit: '5mb' }));
+  app.get('/health', (req, res) => res.json({ ok: true }));
+  // Telegram webhook endpoint will be mounted by telegram module using app.post(...)
 
-  app.get('/', (req, res) => res.send('✅ WhatsApp ↔ Telegram Bridge is running'));
-  app.get('/health', (req, res) =>
-    res.json({
-      ok: true,
-      uptimeSeconds: Math.floor(process.uptime()),
-      timestamp: new Date().toISOString()
-    })
+  const port = parseInt(process.env.PORT || '10000', 10);
+  const server = app.listen(port, () =>
+    logger.info({ port }, '🌐 Web server started on port ' + port)
   );
-
-  const server = app.listen(port, () => {
-    logger.info(`🌐 Web server started on port ${port}`);
-  });
-
-  server.on('error', (err) => {
-    logger.error({ err }, 'HTTP server error');
-  });
-
   return { app, server };
 }
