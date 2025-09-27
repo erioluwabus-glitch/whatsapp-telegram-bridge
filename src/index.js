@@ -1,118 +1,72 @@
 // src/index.js
-/**
- * App orchestrator: Mongo, WhatsApp (Baileys), Telegram, Web server.
- * Supports QR login & OTP fallback (8-digit code).
- */
-
 import mongoose from "mongoose";
-import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
-import { makeWASocket, useMongoAuthState } from "@whiskeysockets/baileys";
-
 import { startServer } from "./server.js";
-import { setupTelegram } from "./telegram.js";
-import { setupGracefulShutdown } from "./graceful.js";
-import logger from "./logger.js";
+import { createTelegram } from "./telegram.js";
+import { startWhatsApp } from "./whatsapp.js"; // your existing WA module (must return handleTelegramUpdate)
+import logger from "./logger.js"; // or replace with console
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const PUBLIC_DIR = process.env.PUBLIC_DIR || path.join(__dirname, "../public");
+const ENV = process.env;
 
-// helper: write OTP into public dir so it can be fetched at /otp.txt
-async function writeOtpFile(code) {
-  try {
-    const filePath = path.join(PUBLIC_DIR, "otp.txt");
-    fs.writeFileSync(filePath, code, "utf-8");
-    logger.info(`📂 OTP code written to ${filePath} (also available at /otp.txt)`);
-  } catch (err) {
-    logger.error("❌ Failed to write OTP file", err);
-  }
-}
+async function main() {
+  logger?.info?.("🔍 Checking required environment variables...");
+  if (!ENV.MONGO_URI) throw new Error("❌ MONGO_URI is required");
+  if (!ENV.TELEGRAM_TOKEN) logger?.warn?.("⚠️ TELEGRAM_TOKEN not set; Telegram will be disabled.");
 
-async function startWhatsApp() {
-  logger.info("🚀 Starting WhatsApp bridge...");
+  const PORT = ENV.PORT ? Number(ENV.PORT) : 10000;
+  const PUBLIC_DIR = ENV.PUBLIC_DIR || "./public";
 
-  // ✅ MongoDB-backed auth state
-  const { state, saveCreds } = await useMongoAuthState(
-    mongoose.connection.db,
-    "wa_sessions"
-  );
+  // start server early so webhook endpoint exists before we ask Telegram to set it
+  const { app, server, setTelegramWebhookHandler } = startServer({ publicDir: PUBLIC_DIR, port: PORT });
 
-  const sock = makeWASocket({
-    auth: state,
-    browser: ["Windows", "Chrome", "118.0.5993.117"],
-    version: [2, 3000, 1010000000],
-    printQRInTerminal: true, // for local dev
+  // connect mongo
+  logger?.info?.("🟦 Connecting to MongoDB...");
+  await mongoose.connect(ENV.MONGO_URI);
+  logger?.info?.("✅ Connected to MongoDB");
+
+  // Telegram helper (no external library)
+  const telegram = createTelegram({ token: ENV.TELEGRAM_TOKEN, chatId: ENV.TELEGRAM_CHAT_ID });
+
+  // Start WhatsApp module. The WA module should expose a function that when called returns
+  // an object including handleTelegramUpdate (the function that expects a Telegram update object).
+  // In your existing whatsapp.js you already implemented `handleTelegramUpdate(update)`.
+  const wa = await startWhatsApp({
+    // pass options if your startWhatsApp supports them
   });
 
-  sock.ev.on("creds.update", saveCreds);
-
-  // ✅ Handle connection lifecycle
-  sock.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    if (qr) {
-      logger.info("📸 QR code generated. Open /qr.png on your server and scan it.");
-    }
-
-    if (connection === "open") {
-      logger.info("✅ WhatsApp connected successfully.");
-    }
-
-    if (connection === "close") {
-      const shouldReconnect =
-        lastDisconnect?.error?.output?.statusCode !== 401;
-
-      if (shouldReconnect) {
-        logger.warn("⚠️ Connection closed. Retrying...");
-        startWhatsApp();
-      } else {
-        logger.error("❌ Session invalid. Clearing and requiring re-login.");
-
-        // ✅ OTP fallback
-        if (process.env.WHATSAPP_NUMBER) {
-          try {
-            const code = await sock.requestPairingCode(
-              process.env.WHATSAPP_NUMBER
-            );
-            logger.info(
-              `📲 OTP pairing code for ${process.env.WHATSAPP_NUMBER}: ${code}`
-            );
-            logger.info("Enter this 8-digit code in WhatsApp → Linked devices.");
-            await writeOtpFile(code); // save for web access
-          } catch (err) {
-            logger.error("❌ Failed to request OTP code", err);
-          }
-        }
+  // wait until we have the handler for Telegram replies -> WhatsApp
+  if (!wa?.handleTelegramUpdate) {
+    logger?.warn?.("⚠️ startWhatsApp did not return handleTelegramUpdate. Ensure whatsapp.js exports/returns it.");
+  } else {
+    // attach the handler into server via our telegram wrapper
+    const webhookHandler = telegram.createWebhookHandler(async (update) => {
+      // Optionally do pre-processing here then pass to WA handler
+      try {
+        await wa.handleTelegramUpdate(update);
+      } catch (err) {
+        console.error("Error in WA handleTelegramUpdate:", err);
+        throw err;
       }
+    });
+
+    setTelegramWebhookHandler(webhookHandler);
+
+    // If WEBHOOK_BASE_URL present, set webhook on Telegram
+    if (ENV.WEBHOOK_BASE_URL) {
+      try {
+        await telegram.setWebhook(ENV.WEBHOOK_BASE_URL);
+        logger?.info?.("✅ Telegram webhook configured:", `${ENV.WEBHOOK_BASE_URL.replace(/\/$/, "")}/telegram/${telegram.token}`);
+      } catch (err) {
+        logger?.warn?.("Failed to set Telegram webhook (see logs). You can set it manually to:", `${ENV.WEBHOOK_BASE_URL.replace(/\/$/, "")}/telegram/${telegram.token}`);
+      }
+    } else {
+      logger?.info?.("ℹ️ WEBHOOK_BASE_URL not set — webhook not registered automatically. Use polling disabled mode or manually set webhook to /telegram/<TOKEN>.");
     }
-  });
+  }
 
-  return sock;
+  logger?.info?.("🚀 Bridge started successfully — ready to forward messages.");
 }
 
-async function startApp() {
-  logger.info("🔍 Checking required environment variables...");
-
-  if (!process.env.MONGO_URI) throw new Error("❌ MONGO_URI is required");
-  if (!process.env.TELEGRAM_BOT_TOKEN)
-    throw new Error("❌ TELEGRAM_BOT_TOKEN is required");
-
-  // ✅ Connect Mongo
-  logger.info("🟦 Connecting to MongoDB...");
-  await mongoose.connect(process.env.MONGO_URI);
-  logger.info("✅ Connected to MongoDB");
-
-  // ✅ Start services
-  await startWhatsApp();
-  await setupTelegram();
-  await startServer();
-
-  // ✅ Graceful shutdown
-  setupGracefulShutdown();
-}
-
-startApp().catch((err) => {
-  logger.error("❌ Fatal error starting app", err);
+main().catch((err) => {
+  console.error("❌ Fatal error starting app", err);
   process.exit(1);
 });
