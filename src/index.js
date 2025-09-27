@@ -24,7 +24,20 @@ async function main() {
   const ADMIN_SECRET = process.env.ADMIN_SECRET || null;
 
   // start web server early
-  const { app, server, setTelegramWebhookHandler } = startServer({ publicDir: PUBLIC_DIR, port: PORT, adminSecret: ADMIN_SECRET });
+  const { app, server, setTelegramWebhookHandler, setLatestQr } = startServer({ publicDir: PUBLIC_DIR, port: PORT, adminSecret: ADMIN_SECRET });
+
+// later, when calling startWhatsApp, pass setLatestQr:
+const wa = await startWhatsApp({
+  telegram: { token: process.env.TELEGRAM_TOKEN, chatId: process.env.TELEGRAM_CHAT_ID },
+  authDir: AUTH_DIR,
+  publicDir: PUBLIC_DIR,
+  setLatestQr, // <- NEW: let whatsapp module update the server's /qr
+  onReady: ({ handleTelegramUpdate }) => {
+    setTelegramWebhookHandler(handleTelegramUpdate);
+    logger.info("✅ Telegram webhook handler attached to server (will forward Telegram replies to WhatsApp)");
+  },
+});
+
 
   // connect to mongo
   logger.info("🟦 Connecting to MongoDB...");
@@ -83,4 +96,5 @@ main().catch((err) => {
   console.error("Fatal startup error:", err);
   process.exit(1);
 });
+
 
