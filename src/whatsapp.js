@@ -5,7 +5,7 @@ import path from "path";
 import crypto from "crypto";
 import qrcode from "qrcode";
 import mongoose from "mongoose";
-import makeWASocket, { useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys';
+import makeWASocket, { useMultiFileAuthState } from '@whiskeysockets/baileys';
 
 // ---------- Mongoose models ----------
 const AuthFileSchema = new mongoose.Schema({
@@ -126,78 +126,19 @@ async function telegramSendRaw(botToken, chatId, payload) {
  */
 export async function startWhatsApp({ authDir = './baileys_auth', publicDir = './public', telegram = {}, onReady = () => {}, whatsappOptions = {} }) {
   // ensure publicDir exists
-  if (!fs.existsSync(publicDir)) fs.mkdirSync(publicDir, { recursive: true });
+  if (!fsSync.existsSync(publicDir)) fsSync.mkdirSync(publicDir, { recursive: true });
 
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
   // Use provided options or sane defaults
   const browser = whatsappOptions.browser || ['Chrome', 'Windows', '10'];
-  const version = whatsappOptions.version || [2, 2413, 12];
-  const maxReconnectAttempts = whatsappOptions.maxReconnectAttempts || 5;
-
-  let reconnectAttempts = 0;
+  const version = whatsappOptions.version || [2, 3000, 1027683323];
 
   const sock = makeWASocket({
     auth: state,
     printQRInTerminal: false,
     browser,
     version,
-  });
-
-  // persist credentials
-  sock.ev.on('creds.update', saveCreds);
-
-  // helper to write QR to public/qr.png
-  async function writeQr(qr) {
-    try {
-      const qrPath = path.join(publicDir, 'qr.png');
-      await qrcode.toFile(qrPath, qr, { width: 300 });
-      console.log('WA QR updated ->', qrPath);
-    } catch (e) {
-      console.error('Failed to write QR file', e);
-    }
-  }
-
-  // connection updates
-  sock.ev.on('connection.update', async (update) => {
-    // QR provided
-    if (update.qr) await writeQr(update.qr);
-
-    const { connection, lastDisconnect } = update;
-
-    if (connection === 'open') {
-      reconnectAttempts = 0;
-      console.log('WhatsApp connected (open).');
-      // expose handler for Telegram wiring once connected
-      if (onReady) {
-        // pass any helper(s) needed by your telegram adapter. For example:
-        onReady({ handleTelegramUpdate: (u) => {/* implement or call your telegram handler */} });
-      }
-    } else if (connection === 'close') {
-      const code = lastDisconnect?.error?.output?.statusCode;
-      console.warn('WhatsApp connection closed', code);
-
-      // If code is 401 => session invalid
-      if (code === 401) {
-        reconnectAttempts++;
-        if (reconnectAttempts <= maxReconnectAttempts) {
-          const backoff = reconnectAttempts * 2000;
-          console.warn(`401 received — attempt reconnect #${reconnectAttempts} in ${backoff}ms`);
-          setTimeout(() => {
-            // try to re-establish connection by re-creating socket (let Node GC old)
-            startWhatsApp({ authDir, publicDir, telegram, onReady, whatsappOptions });
-          }, backoff);
-          return;
-        } else {
-          console.error('Persistent 401 after reconnect attempts. *Do not auto-clear auth*. Please clear session in MongoDB Atlas (or allow me to do it for you) and then re-deploy / re-run to generate a fresh QR.');
-          // signal for manual intervention: do NOT automatically clear data here (safer).
-          return;
-        }
-      }
-
-      // other closes: Baileys will attempt auto-reconnect internally; log it.
-      console.warn('Connection closed (non-401). Baileys will auto-reconnect when possible.');
-    }
   });
 
   // persist on creds.update
@@ -222,7 +163,6 @@ export async function startWhatsApp({ authDir = './baileys_auth', publicDir = '.
       if (qr) {
         const qrPath = path.join(publicDir, "qr.png");
         await qrcode.toFile(qrPath, qr, { width: 640 }).catch((err) => console.error("qrcode.toFile error:", err));
-        const qh = sha256(qr);
         console.info("WA QR updated -> public/qr.png (open your service URL /qr.png)");
       }
 
@@ -322,7 +262,7 @@ export async function startWhatsApp({ authDir = './baileys_auth', publicDir = '.
 
         await sock.sendMessage(mapping.waChatId, { text: `🟦 Reply from Telegram:\n\n${replyText}` });
 
-        const botToken = process.env.TELEGRAM_TOKEN;
+        const botToken = telegram.token;
         if (botToken) {
           await telegramSendRaw(botToken, msg.chat.id, { 
             text: `✅ Delivered reply to WhatsApp (to ${mapping.waChatId})`, 
