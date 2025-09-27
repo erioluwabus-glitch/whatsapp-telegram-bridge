@@ -1,46 +1,29 @@
 // src/server.js
-// Small Express server exposing:
-//  - static public dir (so /qr.png works)
-//  - POST /telegram/:token  (delegates to a handler set at runtime)
-// Exports startServer(...) which returns { app, server, setTelegramWebhookHandler }
-
 import express from "express";
 import path from "path";
+import fs from "fs/promises";
 
-export function startServer({ publicDir = "./public", port = process.env.PORT || 10000 } = {}) {
+export function startServer({ publicDir = "./public", port = process.env.PORT || 10000, adminSecret = process.env.ADMIN_SECRET } = {}) {
   const app = express();
   app.disable("x-powered-by");
-
   app.use(express.json({ limit: "10mb" }));
   app.use(express.urlencoded({ extended: true }));
 
-  // static public folder (qr.png, status pages)
+  // static public folder (qr.png etc)
   app.use(express.static(publicDir));
 
-  // simple health
   app.get("/health", (req, res) => res.json({ ok: true }));
 
-  // holder for handler (will be set by orchestrator once WA is ready)
+  // placeholder for telegram handler (set by orchestrator)
   let telegramHandler = null;
-
-  // The path Telegram will call is /telegram/:token (we check token against env for safety)
   app.post("/telegram/:token", async (req, res) => {
     const tokenFromPath = req.params.token;
-    // verify token if env set, otherwise accept but warn
     if (process.env.TELEGRAM_TOKEN && tokenFromPath !== process.env.TELEGRAM_TOKEN) {
-      console.warn("Telegram webhook invoked with mismatched token in path.");
       return res.status(401).json({ ok: false, error: "invalid token path" });
     }
-
-    if (!telegramHandler) {
-      // not ready yet
-      return res.status(503).json({ ok: false, error: "telegram handler not configured" });
-    }
-
+    if (!telegramHandler) return res.status(503).json({ ok: false, error: "telegram handler not configured" });
     try {
-      // delegate; handler expects the raw update object
       await telegramHandler(req.body);
-      // reply quickly — nothing special required.
       return res.status(200).send("OK");
     } catch (err) {
       console.error("Telegram webhook handler error:", err);
@@ -48,13 +31,46 @@ export function startServer({ publicDir = "./public", port = process.env.PORT ||
     }
   });
 
-  // Start listening
+  // Admin endpoints (protected with ADMIN_SECRET)
+  function checkAdmin(req, res) {
+    if (!adminSecret) return res.status(403).json({ ok: false, error: "admin disabled" });
+    const provided = req.query.secret || req.headers["x-admin-secret"];
+    if (!provided || provided !== adminSecret) return res.status(401).json({ ok: false, error: "invalid admin secret" });
+    return null;
+  }
+
+  // Clears local auth directory files (if present)
+  app.post("/admin/clear-local-auth", async (req, res) => {
+    const bad = checkAdmin(req, res);
+    if (bad) return bad;
+    const authDir = req.body?.authDir || "./baileys_auth";
+    try {
+      // remove auth dir entirely (render machine will recreate on startup if needed)
+      await fs.rm(authDir, { recursive: true, force: true });
+      console.info("Admin: local auth dir cleared:", authDir);
+      return res.json({ ok: true, cleared: authDir });
+    } catch (err) {
+      console.error("Admin clear-local-auth error:", err);
+      return res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  // Trigger a controlled process exit so the platform restarts the service.
+  app.post("/admin/restart", async (req, res) => {
+    const bad = checkAdmin(req, res);
+    if (bad) return bad;
+    res.json({ ok: true, msg: "Process will exit now (supervisor should restart it)" });
+    console.info("Admin: restarting process by request");
+    // give response a moment
+    setTimeout(() => process.exit(0), 250);
+  });
+
   const server = app.listen(port, () => {
     console.info(`🌐 Web server started on port ${port} (public dir=${publicDir})`);
   });
 
-  function setTelegramWebhookHandler(handler) {
-    telegramHandler = handler;
+  function setTelegramWebhookHandler(h) {
+    telegramHandler = h;
     console.info("✅ Telegram webhook handler attached to server");
   }
 
