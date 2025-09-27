@@ -47,6 +47,39 @@ async function restoreAuthFilesFromMongo() {
 
     await fs.mkdir(AUTH_DIR, { recursive: true });
 
+    const filesContainer = doc.files;
+
+    // filesContainer might be:
+    // - an object: { "creds.json": "{}", "state.json": "{}" }
+    // - or an array: [ { filename: "creds.json", data: "..." }, ... ]
+    if (Array.isArray(filesContainer)) {
+      for (const item of filesContainer) {
+        if (item && (item.filename || item.name) && item.data) {
+          const filename = item.filename || item.name;
+          await fs.writeFile(path.join(AUTH_DIR, filename), item.data, 'utf8');
+        } else if (item && typeof item === 'object') {
+          // last-resort: write each key inside the object item
+          for (const k of Object.keys(item)) {
+            await fs.writeFile(path.join(AUTH_DIR, k), String(item[k]), 'utf8');
+          }
+        }
+      }
+    } else if (typeof filesContainer === 'object') {
+      for (const filename of Object.keys(filesContainer)) {
+        const content = filesContainer[filename];
+        await fs.writeFile(path.join(AUTH_DIR, filename), String(content), 'utf8');
+      }
+    } else {
+      logger.warn('Stored session has unexpected shape; skipping restore.');
+    }
+
+    logger.info('Restored Baileys auth files from Mongo to ' + AUTH_DIR);
+  } catch (err) {
+    logger.warn({ err }, 'Failed to restore Baileys auth files from Mongo — starting fresh');
+  }
+}
+
+
     // doc.files is a Map-like object (stored as object); iterate keys
     for (const [filename, content] of Object.entries(Object.fromEntries(doc.files || []))) {
       const filePath = path.join(AUTH_DIR, filename);
@@ -262,3 +295,4 @@ export async function startWhatsApp() {
 }
 
 export default startWhatsApp;
+
