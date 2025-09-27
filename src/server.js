@@ -1,69 +1,62 @@
 // src/server.js
+// Small Express server exposing:
+//  - static public dir (so /qr.png works)
+//  - POST /telegram/:token  (delegates to a handler set at runtime)
+// Exports startServer(...) which returns { app, server, setTelegramWebhookHandler }
+
 import express from "express";
 import path from "path";
-import { fileURLToPath } from "url";
-import bodyParser from "body-parser";
-import logger from "./logger.js";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-export function startServer({ telegramWebhookHandler } = {}) {
+export function startServer({ publicDir = "./public", port = process.env.PORT || 10000 } = {}) {
   const app = express();
+  app.disable("x-powered-by");
 
-  // ✅ Body parsers
-  app.use(bodyParser.json());
-  app.use(bodyParser.urlencoded({ extended: true }));
+  app.use(express.json({ limit: "10mb" }));
+  app.use(express.urlencoded({ extended: true }));
 
-  // ✅ Serve static public dir (like qr.png, assets)
-  const PUBLIC_DIR = process.env.PUBLIC_DIR || path.join(__dirname, "../public");
-  app.use(express.static(PUBLIC_DIR));
+  // static public folder (qr.png, status pages)
+  app.use(express.static(publicDir));
 
-  // ✅ Health check
-  app.get("/healthz", (req, res) => {
-    res.json({ status: "ok", uptime: process.uptime() });
-  });
+  // simple health
+  app.get("/health", (req, res) => res.json({ ok: true }));
 
-  // ✅ QR endpoint (if qr.png exists in PUBLIC_DIR)
-  app.get("/qr.png", (req, res) => {
-    const qrPath = path.join(PUBLIC_DIR, "qr.png");
-    res.sendFile(qrPath, (err) => {
-      if (err) {
-        logger.warn("QR not yet available, refresh after generating...");
-        res.status(404).send("QR not yet generated — check logs or retry.");
-      }
-    });
-  });
+  // holder for handler (will be set by orchestrator once WA is ready)
+  let telegramHandler = null;
 
-  // ✅ Telegram webhook
+  // The path Telegram will call is /telegram/:token (we check token against env for safety)
   app.post("/telegram/:token", async (req, res) => {
-    const { token } = req.params;
-
-    if (!process.env.TELEGRAM_BOT_TOKEN || token !== process.env.TELEGRAM_BOT_TOKEN) {
-      logger.warn("Unauthorized Telegram webhook call");
-      return res.status(401).send("Unauthorized");
+    const tokenFromPath = req.params.token;
+    // verify token if env set, otherwise accept but warn
+    if (process.env.TELEGRAM_TOKEN && tokenFromPath !== process.env.TELEGRAM_TOKEN) {
+      console.warn("Telegram webhook invoked with mismatched token in path.");
+      return res.status(401).json({ ok: false, error: "invalid token path" });
     }
 
-    if (!telegramWebhookHandler) {
-      logger.warn("Telegram webhook handler not yet attached");
-      return res.status(503).send("Handler not ready");
+    if (!telegramHandler) {
+      // not ready yet
+      return res.status(503).json({ ok: false, error: "telegram handler not configured" });
     }
 
     try {
-      await telegramWebhookHandler(req.body);
-      res.sendStatus(200);
+      // delegate; handler expects the raw update object
+      await telegramHandler(req.body);
+      // reply quickly — nothing special required.
+      return res.status(200).send("OK");
     } catch (err) {
-      logger.error("Telegram webhook handler failed:", err);
-      res.sendStatus(500);
+      console.error("Telegram webhook handler error:", err);
+      return res.status(500).json({ ok: false, error: String(err?.message || err) });
     }
   });
 
-  // ✅ Start HTTP server
-  const PORT = process.env.PORT || 10000;
-  app.listen(PORT, () => {
-    logger.info(`🌐 Server listening on port ${PORT}`);
-    logger.info(`📸 QR available at http://localhost:${PORT}/qr.png`);
+  // Start listening
+  const server = app.listen(port, () => {
+    console.info(`🌐 Web server started on port ${port} (public dir=${publicDir})`);
   });
 
-  return app;
+  function setTelegramWebhookHandler(handler) {
+    telegramHandler = handler;
+    console.info("✅ Telegram webhook handler attached to server");
+  }
+
+  return { app, server, setTelegramWebhookHandler };
 }
