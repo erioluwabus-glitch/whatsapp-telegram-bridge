@@ -1,70 +1,68 @@
 // src/server.js
-import express from 'express';
-import path from 'path';
-import bodyParser from 'body-parser';
+import express from "express";
+import path from "path";
+import { fileURLToPath } from "url";
+import bodyParser from "body-parser";
+import logger from "./logger.js";
 
-/**
- * startServer(opts)
- * opts:
- *   - port (default 10000)
- *   - telegramToken (process.env.TELEGRAM_TOKEN)
- *   - telegramWebhookHandler: async function(update) -> handles incoming Telegram updates
- *
- * Usage:
- *   startServer({ telegramWebhookHandler: whatsappApi.handleTelegramUpdate });
- */
-export function startServer(opts = {}) {
-  const port = opts.port || process.env.PORT || 10000;
-  const telegramToken = opts.telegramToken || process.env.TELEGRAM_TOKEN;
-  const webhookBase = process.env.WEBHOOK_BASE_URL || null;
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
+export function startServer({ telegramWebhookHandler } = {}) {
   const app = express();
 
-  // serve public static files (qr.png)
-  const publicDir = path.resolve('./public');
-  app.use(express.static(publicDir));
+  // ✅ Body parsers
+  app.use(bodyParser.json());
+  app.use(bodyParser.urlencoded({ extended: true }));
 
-  // health
-  app.get('/', (req, res) => res.send('✅ WhatsApp-Telegram Bridge running'));
+  // ✅ Serve static public dir (like qr.png, assets)
+  const PUBLIC_DIR = process.env.PUBLIC_DIR || path.join(__dirname, "../public");
+  app.use(express.static(PUBLIC_DIR));
 
-  // Telegram webhook endpoint: POST /telegram/<BOT_TOKEN>
-  app.post('/telegram/:token', bodyParser.json(), async (req, res) => {
+  // ✅ Health check
+  app.get("/healthz", (req, res) => {
+    res.json({ status: "ok", uptime: process.uptime() });
+  });
+
+  // ✅ QR endpoint (if qr.png exists in PUBLIC_DIR)
+  app.get("/qr.png", (req, res) => {
+    const qrPath = path.join(PUBLIC_DIR, "qr.png");
+    res.sendFile(qrPath, (err) => {
+      if (err) {
+        logger.warn("QR not yet available, refresh after generating...");
+        res.status(404).send("QR not yet generated — check logs or retry.");
+      }
+    });
+  });
+
+  // ✅ Telegram webhook
+  app.post("/telegram/:token", async (req, res) => {
+    const { token } = req.params;
+
+    if (!process.env.TELEGRAM_BOT_TOKEN || token !== process.env.TELEGRAM_BOT_TOKEN) {
+      logger.warn("Unauthorized Telegram webhook call");
+      return res.status(401).send("Unauthorized");
+    }
+
+    if (!telegramWebhookHandler) {
+      logger.warn("Telegram webhook handler not yet attached");
+      return res.status(503).send("Handler not ready");
+    }
+
     try {
-      const token = req.params.token;
-      if (!telegramToken || token !== telegramToken) {
-        return res.status(403).send('forbidden');
-      }
-      // forward the update to the provided handler
-      if (opts.telegramWebhookHandler) {
-        // don't await long-running processing (respond quickly)
-        opts.telegramWebhookHandler(req.body).catch(err => {
-          console.error('telegramWebhookHandler error:', err);
-        });
-      }
-      return res.status(200).send('ok');
+      await telegramWebhookHandler(req.body);
+      res.sendStatus(200);
     } catch (err) {
-      console.error('Telegram webhook error:', err);
-      return res.status(500).send('error');
+      logger.error("Telegram webhook handler failed:", err);
+      res.sendStatus(500);
     }
   });
 
-  // convenience endpoint: redirect /qr to actual png if present
-  app.get('/qr', (req, res) => {
-    if (fsSync.existsSync(path.join(publicDir, 'qr.png'))) {
-      return res.redirect('/qr.png');
-    }
-    return res.status(404).send('no QR available');
-  });
-
-  app.listen(port, () => {
-    console.info(`🌐 Web server started on port ${port}`);
-    if (webhookBase && telegramToken) {
-      const webhookUrl = `${webhookBase.replace(/\/$/, '')}/telegram/${telegramToken}`;
-      console.info('Telegram webhook should be set to:', webhookUrl);
-      console.info('If you use the node-telegram-bot-api library, disable polling and use the webhook endpoint above.');
-    } else {
-      console.info('WEBHOOK_BASE_URL or TELEGRAM_TOKEN not set; telegram webhook not auto-announced.');
-    }
+  // ✅ Start HTTP server
+  const PORT = process.env.PORT || 10000;
+  app.listen(PORT, () => {
+    logger.info(`🌐 Server listening on port ${PORT}`);
+    logger.info(`📸 QR available at http://localhost:${PORT}/qr.png`);
   });
 
   return app;
