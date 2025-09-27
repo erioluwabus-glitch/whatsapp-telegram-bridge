@@ -1,10 +1,13 @@
+# Node
 node_modules/
+npm-debug.log
+yarn-error.log
 .env
-*.log
+
+# Baileys auth folder (don't commit auth files)
+baileys_auth/
+
+# Build / system
 .DS_Store
-desktop.ini
-dist/
-build/
-*.exe
-*.dll
-package-lock.json
+.vscode/
+*.log
